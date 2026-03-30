@@ -935,19 +935,39 @@ async def get_jupyter_ydoc(serverapp: Any, file_id: str):
 
     return None
 
+# Cache NotebookModel instances per notebook path to ensure consistent
+# transaction origins and proper locking across rapid successive operations.
+# Without caching, each insert_cell call creates a new NotebookModel with a
+# new random _changes_origin, causing JupyterLab's frontend to receive a
+# flood of Y.js updates with different origins. This overwhelms the windowed
+# rendering and causes cells to appear without their content (editors not
+# created). Reusing the same model ensures a consistent origin and proper
+# serialization through the shared lock.
+_notebook_model_cache: dict[str, NotebookModel] = {}
+
 async def get_notebook_model(serverapp: Any, notebook_path: str):
     """Get the NotebookModel instance if it's currently open in a collaborative session."""
+    global _notebook_model_cache
+
     # Get file_id from file_id_manager
     file_id_manager = serverapp.web_app.settings.get("file_id_manager")
     if file_id_manager is None:
         raise RuntimeError("file_id_manager not available in serverapp")
-    
+
     file_id = file_id_manager.get_id(notebook_path)
     ydoc = await get_jupyter_ydoc(serverapp, file_id)
     if ydoc is None:
+        _notebook_model_cache.pop(notebook_path, None)
         return None
+
+    # Reuse cached model if it references the same YDoc
+    cached = _notebook_model_cache.get(notebook_path)
+    if cached is not None and cached._doc is ydoc:
+        return cached
+
     nb = NotebookModel()
     nb._doc = ydoc
+    _notebook_model_cache[notebook_path] = nb
     return nb
 
 

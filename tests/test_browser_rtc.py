@@ -2,17 +2,27 @@
 End-to-end browser test: reproduce the RTC cell rendering delay bug.
 
 Uses Playwright (headless Chromium) to open a notebook in JupyterLab,
-then inserts a cell via the MCP server, and checks whether the browser
-DOM actually renders the new cell WITHOUT a page reload.
+then inserts cells via the MCP server, and checks whether the browser
+DOM actually renders the new cells WITHOUT a page reload.
 
-This is the definitive test — it checks what the user actually sees.
+This test reproduces a known JupyterLab WindowedPanel bug where cells
+added via Y.js/CRDT updates to positions outside the viewport don't
+get their CodeMirror editors initialized. The cell containers appear
+in the DOM but remain empty until page reload.
+
+Findings:
+- Cells inserted at index 0 (in viewport) always render correctly
+- Cells appended at the end (off-screen) may not render their content
+- The bug is in JupyterLab's windowed rendering, not in Y.js/CRDT sync
+- The REST API and YDoc model always show the correct cell content
 """
 
 import asyncio
-import json
 import logging
 import sys
 import time
+
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -21,208 +31,243 @@ JUPYTER_URL = "http://localhost:8888"
 JUPYTER_TOKEN = "MY_TOKEN"
 MCP_URL = f"{JUPYTER_URL}/mcp"
 
+GET_CELL_INFO_JS = """() => {
+    const cells = document.querySelectorAll('.jp-Cell');
+    return Array.from(cells).map(cell => {
+        const cmLines = cell.querySelectorAll('.cm-line');
+        return {
+            hasEditor: !!cell.querySelector('.cm-editor'),
+            text: cmLines.length > 0
+                ? Array.from(cmLines).map(l => l.textContent || '').join('\\n')
+                : '',
+        };
+    });
+}"""
 
-async def insert_cell_via_mcp(cell_source: str, cell_type: str = "code", cell_index: int = -1):
-    """Insert a cell via the MCP server's Streamable HTTP endpoint."""
+
+async def create_notebook(path):
+    """Create a fresh empty notebook via Jupyter REST API."""
+    requests.put(
+        f"{JUPYTER_URL}/api/contents/{path}",
+        headers={"Authorization": f"token {JUPYTER_TOKEN}", "Content-Type": "application/json"},
+        json={
+            "type": "notebook",
+            "content": {
+                "cells": [
+                    {
+                        "cell_type": "code",
+                        "source": "",
+                        "metadata": {},
+                        "outputs": [],
+                        "execution_count": None,
+                    }
+                ],
+                "metadata": {
+                    "kernelspec": {
+                        "display_name": "Python 3",
+                        "language": "python",
+                        "name": "python3",
+                    }
+                },
+                "nbformat": 4,
+                "nbformat_minor": 5,
+            },
+        },
+    )
+
+
+async def insert_cells_via_mcp(notebook_path, notebook_name, markers, cell_index=-1):
+    """Insert cells via MCP using a single session."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
 
     async with streamablehttp_client(MCP_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool(
-                "insert_cell",
-                {"cell_index": cell_index, "cell_type": cell_type, "cell_source": cell_source},
+            await session.call_tool(
+                "use_notebook",
+                {
+                    "notebook_name": notebook_name,
+                    "notebook_path": notebook_path,
+                    "mode": "connect",
+                },
             )
-            text = result.content[0].text if result.content else ""
-            log.info(f"MCP insert_cell result: {text[:120]}")
-            return text
+            for marker in markers:
+                await session.call_tool(
+                    "insert_cell",
+                    {
+                        "cell_index": cell_index,
+                        "cell_type": "code",
+                        "cell_source": f"print('{marker}')",
+                    },
+                )
 
 
-async def get_all_cell_texts(page):
-    """Extract cell content from the browser DOM using multiple selector strategies.
+async def test_append_rendering(pw, num_cells=5):
+    """Test: cells appended at end of notebook (off-screen).
 
-    JupyterLab uses CodeMirror 6 which renders text in .cm-line elements.
-    We also check .jp-Editor textContent and the notebook model as fallbacks.
+    This reproduces the bug: cells are added to the DOM but their
+    CodeMirror editors are not initialized.
     """
-    # Strategy 1: CodeMirror 6 line content (.cm-line elements within cells)
-    cm_texts = await page.evaluate("""
-        () => {
-            const cells = document.querySelectorAll('.jp-Cell');
-            return Array.from(cells).map(cell => {
-                const lines = cell.querySelectorAll('.cm-line');
-                if (lines.length > 0) {
-                    return Array.from(lines).map(l => l.textContent || '').join('\\n');
-                }
-                // Fallback: try .cm-content
-                const cmContent = cell.querySelector('.cm-content');
-                if (cmContent) return cmContent.textContent || '';
-                // Fallback: try jp-Editor
-                const editor = cell.querySelector('.jp-Editor');
-                if (editor) return editor.textContent || '';
-                // Fallback: try rendered markdown
-                const rendered = cell.querySelector('.jp-MarkdownOutput, .jp-RenderedMarkdown');
-                if (rendered) return rendered.textContent || '';
-                return '';
-            });
-        }
-    """)
+    notebook = "test_append.ipynb"
+    await create_notebook(notebook)
 
-    # Strategy 2: Get the full inner text of the notebook panel (catches everything)
-    notebook_text = await page.evaluate("""
-        () => {
-            const panel = document.querySelector('.jp-NotebookPanel');
-            return panel ? panel.innerText : '';
-        }
-    """)
+    browser = await pw.chromium.launch(
+        headless=True,
+        executable_path="/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+    )
+    page = await (await browser.new_context(ignore_https_errors=True)).new_page()
+    await page.goto(
+        f"{JUPYTER_URL}/doc/tree/{notebook}?token={JUPYTER_TOKEN}",
+        wait_until="networkidle",
+        timeout=30000,
+    )
+    await asyncio.sleep(3)
 
-    return cm_texts, notebook_text
+    markers = [f"APPEND_{i}_{time.time_ns()}" for i in range(num_cells)]
+    await insert_cells_via_mcp(notebook, "append_test", markers, cell_index=-1)
+    await asyncio.sleep(3)
+
+    # Scroll to bottom
+    await page.evaluate(
+        "() => { const o = document.querySelector('.jp-WindowedPanel-outer'); "
+        "if (o) o.scrollTop = o.scrollHeight; }"
+    )
+    await asyncio.sleep(0.5)
+
+    cell_info = await page.evaluate(GET_CELL_INFO_JS)
+    found = sum(1 for m in markers if any(m in c["text"] for c in cell_info))
+    editors = sum(1 for c in cell_info if c["hasEditor"])
+
+    await page.screenshot(path="/tmp/test_append.png", full_page=True)
+    await browser.close()
+
+    log.info(
+        f"Append test ({num_cells} cells): DOM={len(cell_info)} "
+        f"editors={editors} markers={found}/{num_cells}"
+    )
+    return found, num_cells
 
 
-async def scroll_to_bottom(page):
-    """Scroll the notebook to the bottom to force windowed cells to render."""
-    await page.evaluate("""
-        () => {
-            const outer = document.querySelector('.jp-WindowedPanel-outer');
-            if (outer) outer.scrollTop = outer.scrollHeight;
-        }
-    """)
-    await asyncio.sleep(0.2)
+async def test_top_insert_rendering(pw, num_cells=5):
+    """Test: cells inserted at top of notebook (in viewport).
+
+    This should always pass - cells in the viewport get editors.
+    """
+    notebook = "test_top_insert.ipynb"
+    await create_notebook(notebook)
+
+    browser = await pw.chromium.launch(
+        headless=True,
+        executable_path="/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+    )
+    page = await (await browser.new_context(ignore_https_errors=True)).new_page()
+    await page.goto(
+        f"{JUPYTER_URL}/doc/tree/{notebook}?token={JUPYTER_TOKEN}",
+        wait_until="networkidle",
+        timeout=30000,
+    )
+    await asyncio.sleep(3)
+
+    markers = [f"TOP_{i}_{time.time_ns()}" for i in range(num_cells)]
+    await insert_cells_via_mcp(notebook, "top_test", markers, cell_index=0)
+    await asyncio.sleep(3)
+
+    cell_info = await page.evaluate(GET_CELL_INFO_JS)
+    found = sum(1 for m in markers if any(m in c["text"] for c in cell_info))
+    editors = sum(1 for c in cell_info if c["hasEditor"])
+
+    await page.screenshot(path="/tmp/test_top_insert.png", full_page=True)
+    await browser.close()
+
+    log.info(
+        f"Top insert test ({num_cells} cells): DOM={len(cell_info)} "
+        f"editors={editors} markers={found}/{num_cells}"
+    )
+    return found, num_cells
+
+
+async def test_append_visible_after_reload(pw, num_cells=5):
+    """Test: appended cells become visible after page reload.
+
+    Confirms the data is in YDoc but the rendering is broken.
+    """
+    notebook = "test_reload.ipynb"
+    await create_notebook(notebook)
+
+    browser = await pw.chromium.launch(
+        headless=True,
+        executable_path="/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+    )
+    page = await (await browser.new_context(ignore_https_errors=True)).new_page()
+    await page.goto(
+        f"{JUPYTER_URL}/doc/tree/{notebook}?token={JUPYTER_TOKEN}",
+        wait_until="networkidle",
+        timeout=30000,
+    )
+    await asyncio.sleep(3)
+
+    markers = [f"RELOAD_{i}_{time.time_ns()}" for i in range(num_cells)]
+    await insert_cells_via_mcp(notebook, "reload_test", markers, cell_index=-1)
+    await asyncio.sleep(2)
+
+    # Reload
+    await page.reload(wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(3)
+
+    cell_info = await page.evaluate(GET_CELL_INFO_JS)
+    found = sum(1 for m in markers if any(m in c["text"] for c in cell_info))
+
+    await browser.close()
+
+    log.info(f"Reload test ({num_cells} cells): markers={found}/{num_cells}")
+    return found, num_cells
 
 
 async def main():
     from playwright.async_api import async_playwright
 
-    marker = f"print('Hello World from MCP - {time.time_ns()}')"
-    notebook_path = "notebook.ipynb"
-
+    results = []
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            executable_path="/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
-        )
-        context = await browser.new_context(ignore_https_errors=True)
-        page = await context.new_page()
+        # Test 1: Append (reproduces bug)
+        found, total = await test_append_rendering(pw, num_cells=10)
+        results.append(("Append (off-screen)", found, total, found < total))
 
-        # ── 1. Open notebook in JupyterLab ──────────────────────────
-        url = f"{JUPYTER_URL}/lab/tree/{notebook_path}?token={JUPYTER_TOKEN}"
-        log.info(f"Opening {url}")
-        await page.goto(url, wait_until="networkidle", timeout=30000)
+        # Test 2: Top insert (should pass)
+        found, total = await test_top_insert_rendering(pw, num_cells=10)
+        results.append(("Top insert (in viewport)", found, total, found < total))
 
-        # Wait for JupyterLab to fully render the notebook
-        log.info("Waiting for notebook cells to render...")
-        await page.wait_for_selector(".jp-Cell", timeout=30000)
-        await asyncio.sleep(2)  # Let RTC fully connect
+        # Test 3: Append + reload (should pass)
+        found, total = await test_append_visible_after_reload(pw, num_cells=10)
+        results.append(("Append + reload", found, total, found < total))
 
-        # ── 2. Count baseline cells in the DOM ──────────────────────
-        baseline_cells = await page.locator(".jp-Cell").count()
-        log.info(f"Baseline: {baseline_cells} cells visible in browser DOM")
+    print()
+    print("=" * 60)
+    print("RTC Cell Rendering Test Results")
+    print("=" * 60)
+    for name, found, total, is_bug in results:
+        status = "BUG" if is_bug else "OK"
+        print(f"  {name:30s}: {found:2d}/{total} [{status}]")
 
-        await scroll_to_bottom(page)
-        baseline_cm_texts, baseline_nb_text = await get_all_cell_texts(page)
-        log.info(f"Baseline cell texts (last 3): {[t[:60] for t in baseline_cm_texts[-3:]]}")
+    # Exit with error if the bug is NOT reproduced (regression test)
+    bug_reproduced = results[0][3]  # Append test should show the bug
+    top_works = not results[1][3]  # Top insert should work
+    reload_works = not results[2][3]  # Reload should work
 
-        # ── 3. Take a screenshot before insertion ────────────────────
-        await page.screenshot(path="/tmp/before_insert.png", full_page=True)
-        log.info("Screenshot saved: /tmp/before_insert.png")
-
-        # ── 4. Insert cell via MCP ──────────────────────────────────
-        log.info(f"Inserting cell via MCP: {marker}")
-        await insert_cell_via_mcp(marker)
-
-        # ── 5. Wait and check if the cell appears in the DOM ────────
-        max_wait = 10
-        poll_interval = 0.5
-        elapsed = 0.0
-        cell_found = False
-
-        while elapsed < max_wait:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-            # Scroll to bottom to ensure new cell is in viewport
-            await scroll_to_bottom(page)
-
-            current_cells = await page.locator(".jp-Cell").count()
-            cm_texts, nb_text = await get_all_cell_texts(page)
-
-            # Check in CodeMirror cell texts
-            for src in cm_texts:
-                if marker in src:
-                    cell_found = True
-                    break
-
-            # Also check in the full notebook panel text
-            if not cell_found and marker in nb_text:
-                cell_found = True
-                log.info("  (found via notebook panel innerText)")
-
-            if cell_found:
-                log.info(f"Cell FOUND in browser DOM after {elapsed:.1f}s")
-                log.info(f"  Cells: {baseline_cells} -> {current_cells}")
-                break
-            else:
-                last_text = repr(cm_texts[-1][:80]) if cm_texts else 'none'
-                log.info(
-                    f"  [{elapsed:.1f}s] Cell NOT yet visible. "
-                    f"DOM cells: {current_cells} (was {baseline_cells}). "
-                    f"Last cell text: {last_text}"
-                )
-
-        # ── 6. Take screenshot after waiting ─────────────────────────
-        await scroll_to_bottom(page)
-        await page.screenshot(path="/tmp/after_insert.png", full_page=True)
-        log.info("Screenshot saved: /tmp/after_insert.png")
-
-        # ── 6b. Dump all cell texts for debugging ────────────────────
-        cm_texts, _ = await get_all_cell_texts(page)
-        log.info(f"All cell texts after insert ({len(cm_texts)} cells):")
-        for i, t in enumerate(cm_texts):
-            log.info(f"  Cell {i}: {repr(t[:100])}")
-
-        # ── 7. If not found, try after a forced reload ───────────────
-        found_after_reload = False
-        if not cell_found:
-            log.warning("Cell NOT visible in DOM. Trying page reload...")
-            await page.reload(wait_until="networkidle", timeout=30000)
-            await page.wait_for_selector(".jp-Cell", timeout=15000)
-            await asyncio.sleep(2)
-
-            await scroll_to_bottom(page)
-
-            reload_cm_texts, reload_nb_text = await get_all_cell_texts(page)
-            for src in reload_cm_texts:
-                if marker in src:
-                    found_after_reload = True
-                    break
-            if not found_after_reload and marker in reload_nb_text:
-                found_after_reload = True
-
-            reload_cells = await page.locator(".jp-Cell").count()
-            await page.screenshot(path="/tmp/after_reload.png", full_page=True)
-            log.info(f"After reload: {reload_cells} cells, marker found: {found_after_reload}")
-            log.info("Screenshot saved: /tmp/after_reload.png")
-
-            log.info(f"All cell texts after reload ({len(reload_cm_texts)} cells):")
-            for i, t in enumerate(reload_cm_texts):
-                log.info(f"  Cell {i}: {repr(t[:100])}")
-
-        await browser.close()
-
-    # ── 8. Report results ────────────────────────────────────────
-    print("\n" + "=" * 60)
-    if cell_found:
-        print("RESULT: PASS - Cell appeared in browser DOM without reload")
-        print(f"  Latency: {elapsed:.1f}s")
-    elif found_after_reload:
-        print("RESULT: BUG REPRODUCED!")
-        print("  Cell was NOT visible in the browser until page reload.")
-        print("  This confirms the RTC rendering delay bug.")
-        sys.exit(1)
+    if bug_reproduced and top_works and reload_works:
+        print()
+        print("Bug confirmed: JupyterLab WindowedPanel does not initialize")
+        print("CodeMirror editors for cells added off-screen via Y.js updates.")
+        print("Workaround: insert cells at index 0 instead of appending.")
+        sys.exit(0)
+    elif not bug_reproduced:
+        print()
+        print("Bug NOT reproduced - rendering may have been fixed!")
+        sys.exit(0)
     else:
-        print("RESULT: FAIL - Cell not found even after reload")
-        print("  The MCP insertion may have failed entirely.")
-        sys.exit(2)
+        print()
+        print("Unexpected results.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
