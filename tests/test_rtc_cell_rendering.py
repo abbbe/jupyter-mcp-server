@@ -33,6 +33,8 @@ import time
 
 import pytest
 import requests
+from jupyter_nbmodel_client import NbModelClient
+from jupyter_nbmodel_client.helpers import get_jupyter_notebook_websocket_url
 
 from .test_common import MCPClient, timeout_wrapper
 from .conftest import JUPYTER_TOKEN
@@ -290,3 +292,191 @@ async def test_rtc_rapid_insertions_all_visible(mcp_client_parametrized: MCPClie
             # Delete in reverse order to maintain index validity
             for idx in sorted(indices_to_delete, reverse=True):
                 await mcp_client_parametrized.delete_cell([idx])
+
+
+###############################################################################
+# WebSocket YDoc client tests - simulate a real browser frontend
+###############################################################################
+
+async def _connect_ydoc_client(jupyter_url: str, notebook_path: str) -> NbModelClient:
+    """Connect an NbModelClient to the collaboration room for a notebook.
+
+    This is equivalent to what the JupyterLab frontend does when opening
+    a notebook: it connects via WebSocket to the YDoc room and syncs the
+    shared document via the CRDT protocol.
+
+    Args:
+        jupyter_url: Jupyter server base URL (http://...)
+        notebook_path: Relative notebook path
+
+    Returns:
+        A started NbModelClient that is synced with the room's YDoc.
+    """
+    ws_url = get_jupyter_notebook_websocket_url(
+        server_url=jupyter_url,
+        path=notebook_path,
+        token=JUPYTER_TOKEN,
+    )
+    client = NbModelClient(websocket_url=ws_url, path=notebook_path)
+    await client.start()
+    return client
+
+
+@pytest.mark.asyncio
+@timeout_wrapper(60)
+async def test_rtc_ws_insert_cell_visible_to_ydoc_client(
+    mcp_client_parametrized: MCPClient, jupyter_server
+):
+    """Verify that a cell inserted via MCP is visible to a separate WebSocket
+    YDoc client — the same sync channel a JupyterLab browser tab uses.
+
+    This is the most accurate simulation of the reported bug:
+    1. A YDoc WebSocket client connects (= browser opens the notebook)
+    2. MCP tool inserts a cell (= Claude adds code)
+    3. The WebSocket client's local YDoc should receive the update
+       WITHOUT needing to disconnect/reconnect (= no page reload)
+    """
+    marker_text = f"# WS YDoc test {time.time_ns()}"
+    notebook_path = "notebook.ipynb"
+
+    # 1. Connect a YDoc WebSocket client (simulating the browser frontend)
+    frontend_client = await _connect_ydoc_client(jupyter_server, notebook_path)
+    try:
+        # Read baseline cell count from the frontend client's YDoc
+        baseline_cells = len(frontend_client)
+        logging.info(f"Frontend YDoc baseline: {baseline_cells} cells")
+
+        # 2. Insert a cell via MCP tool
+        async with mcp_client_parametrized:
+            result = await mcp_client_parametrized.insert_cell(
+                cell_index=-1,
+                cell_type="markdown",
+                cell_source=marker_text,
+            )
+            assert result is not None, "insert_cell should succeed"
+            logging.info(f"Cell inserted via MCP: {result['result'][:100]}")
+
+            # 3. Poll the frontend client's YDoc for the new cell
+            # In a working RTC setup, the CRDT update should arrive via
+            # WebSocket within milliseconds. We allow up to 5s.
+            max_wait_seconds = 5
+            poll_interval = 0.3
+            cell_found = False
+            elapsed = 0.0
+
+            while elapsed < max_wait_seconds:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+                # Check the frontend client's local YDoc
+                current_count = len(frontend_client)
+                if current_count > baseline_cells:
+                    # Check if our marker cell is there
+                    for i in range(current_count):
+                        source = frontend_client.get_cell_source(i)
+                        if marker_text in source:
+                            cell_found = True
+                            break
+
+                if cell_found:
+                    logging.info(
+                        f"WebSocket YDoc sync confirmed after {elapsed:.1f}s"
+                    )
+                    break
+
+            # 4. Assert
+            assert cell_found, (
+                f"Cell '{marker_text}' was NOT visible on the WebSocket YDoc "
+                f"client after {max_wait_seconds}s. This confirms the reported "
+                f"bug: MCP inserts a cell into the server's YDoc, but the CRDT "
+                f"update does NOT propagate to connected WebSocket clients "
+                f"(browser tabs). The user must reload to see the change. "
+                f"Baseline: {baseline_cells}, Current: {len(frontend_client)}"
+            )
+
+            # 5. Cleanup
+            last_index = len(frontend_client) - 1
+            await mcp_client_parametrized.delete_cell([last_index])
+
+    finally:
+        await frontend_client.stop()
+
+
+@pytest.mark.asyncio
+@timeout_wrapper(90)
+async def test_rtc_ws_new_notebook_hello_world(
+    mcp_client_parametrized: MCPClient, jupyter_server
+):
+    """Exact reproduction of the reported bug scenario with WebSocket validation.
+
+    Steps (matching the user's report):
+    1. Open a notebook in the browser (= connect YDoc WebSocket client)
+    2. Ask Claude to add a hello world cell (= insert via MCP)
+    3. Check if the browser sees it (= check YDoc client's local state)
+    """
+    marker_text = f"print('Hello, World! - WS test {time.time_ns()}')"
+    test_notebook = "new.ipynb"
+
+    # Simulate browser opening the notebook
+    frontend_client = await _connect_ydoc_client(jupyter_server, test_notebook)
+    try:
+        baseline_cells = len(frontend_client)
+        logging.info(
+            f"Frontend opened notebook with {baseline_cells} cells"
+        )
+
+        async with mcp_client_parametrized:
+            # Simulate Claude connecting to the notebook and adding a cell
+            result = await mcp_client_parametrized.use_notebook(
+                "ws_test_nb", test_notebook
+            )
+            logging.info(f"MCP connected: {result}")
+
+            result = await mcp_client_parametrized.insert_cell(
+                cell_index=-1,
+                cell_type="code",
+                cell_source=marker_text,
+            )
+            assert result is not None, "insert_cell should succeed"
+            logging.info(f"MCP inserted cell: {result['result'][:100]}")
+
+            # Check if the browser's YDoc received the update
+            max_wait_seconds = 5
+            poll_interval = 0.3
+            cell_found = False
+            elapsed = 0.0
+
+            while elapsed < max_wait_seconds:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+                for i in range(len(frontend_client)):
+                    source = frontend_client.get_cell_source(i)
+                    if marker_text in source:
+                        cell_found = True
+                        break
+
+                if cell_found:
+                    logging.info(
+                        f"Browser sees Hello World after {elapsed:.1f}s"
+                    )
+                    break
+
+            assert cell_found, (
+                f"Hello World cell was NOT visible on the browser's WebSocket "
+                f"YDoc client after {max_wait_seconds}s. This is the exact "
+                f"bug reported: Claude adds a cell via MCP, but the browser "
+                f"does not render it until the user reloads the page."
+            )
+
+            # Cleanup
+            for i in range(len(frontend_client)):
+                source = frontend_client.get_cell_source(i)
+                if marker_text in source:
+                    await mcp_client_parametrized.delete_cell([i])
+                    break
+
+            await mcp_client_parametrized.unuse_notebook("ws_test_nb")
+
+    finally:
+        await frontend_client.stop()
