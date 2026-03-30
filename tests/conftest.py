@@ -33,6 +33,9 @@ JUPYTER_TOKEN = "MY_TOKEN"
 TEST_MCP_SERVER = os.environ.get("TEST_MCP_SERVER", "true").lower() == "true"
 TEST_JUPYTER_SERVER = os.environ.get("TEST_JUPYTER_SERVER", "true").lower() == "true"
 
+# Auto-detect if running as root and need --allow-root
+_ALLOW_ROOT = ["--allow-root"] if os.getuid() == 0 else []
+
 
 def _start_server(
     name: str, host: str, port: int, command: list, readiness_endpoint: str, max_retries: int = 5
@@ -126,6 +129,7 @@ def jupyter_server():
             "--ServerApp.root_dir",
             "./dev/content",
             "--no-browser",
+            *_ALLOW_ROOT,
         ],
         readiness_endpoint="/api",
         max_retries=10,
@@ -135,15 +139,15 @@ def jupyter_server():
 @pytest.fixture(scope="session")
 def jupyter_server_with_extension():
     """Start Jupyter server with MCP extension loaded (JUPYTER_SERVER mode)
-    
+
     This fixture starts Jupyter Lab with the jupyter_mcp_server extension enabled,
     allowing tests to verify JUPYTER_SERVER mode functionality (YDoc, direct kernel access, etc).
-    
+
     Only starts if TEST_JUPYTER_SERVER=True, otherwise skips.
     """
     if not TEST_JUPYTER_SERVER:
         pytest.skip("TEST_JUPYTER_SERVER is disabled")
-    
+
     host = "localhost"
     port = 8889  # Different port to avoid conflicts
     yield from _start_server(
@@ -162,6 +166,7 @@ def jupyter_server_with_extension():
             "--ServerApp.root_dir",
             "./dev/content",
             "--no-browser",
+            *_ALLOW_ROOT,
             # Load the MCP extension
             "--ServerApp.jpserver_extensions",
             '{"jupyter_mcp_server": True}',
