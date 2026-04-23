@@ -214,16 +214,17 @@ def _get_test_params():
         params.append("mcp_server")
     if TEST_JUPYTER_SERVER:
         params.append("jupyter_extension")
+        params.append("jupyter_extension_no_collab")
     if not params:
         pytest.skip("Both TEST_MCP_SERVER and TEST_JUPYTER_SERVER are disabled")
     return params
 
 
-def _yield_mcp_url(request, extension_fixture, name_suffix="", otel_file=""):
+def _yield_mcp_url(request, fixtures, name_suffix="", otel_file=""):
     """Shared generator for the parametrized ``mcp_server_url*`` fixtures.
 
-    * ``"mcp_server"``      – spins up a standalone MCP server subprocess.
-    * ``"jupyter_extension"`` – yields the URL from *extension_fixture*.
+    * ``"mcp_server"``  – spins up a standalone MCP server subprocess.
+    * Extension params  – resolved via *fixtures* dict (param name → fixture name).
     """
     if request.param == "mcp_server":
         jupyter_server = request.getfixturevalue("jupyter_server")
@@ -236,8 +237,8 @@ def _yield_mcp_url(request, extension_fixture, name_suffix="", otel_file=""):
             command=_mcp_server_command(jupyter_server, port, otel_file=otel_file),
             readiness_endpoint="/api/healthz",
         )
-    else:  # jupyter_extension
-        yield request.getfixturevalue(extension_fixture)
+    else:
+        yield request.getfixturevalue(fixtures[request.param])
 
 
 ###############################################################################
@@ -245,14 +246,11 @@ def _yield_mcp_url(request, extension_fixture, name_suffix="", otel_file=""):
 ###############################################################################
 
 
-@pytest.fixture(scope="session")
-def jupyter_server_with_extension():
-    """Start Jupyter server with MCP extension loaded (JUPYTER_SERVER mode)
+def _start_extension_server(name, cmd_kwargs=None, server_kwargs=None):
+    """Start a JupyterLab+MCP extension server.
 
-    This fixture starts Jupyter Lab with the jupyter_mcp_server extension enabled,
-    allowing tests to verify JUPYTER_SERVER mode functionality (YDoc, direct kernel access, etc).
-
-    Only starts if TEST_JUPYTER_SERVER=True, otherwise skips.
+    *cmd_kwargs* are forwarded to ``_jupyter_extension_command``.
+    *server_kwargs* are forwarded to ``_start_server``.
     """
     if not TEST_JUPYTER_SERVER:
         pytest.skip("TEST_JUPYTER_SERVER is disabled")
@@ -260,12 +258,28 @@ def jupyter_server_with_extension():
     host = "localhost"
     port = _find_free_port()
     yield from _start_server(
-        name="JupyterLab+MCP",
+        name=name,
         host=host,
         port=port,
-        command=_jupyter_extension_command(host, port),
+        command=_jupyter_extension_command(host, port, **(cmd_kwargs or {})),
         readiness_endpoint="/api",
         max_retries=10,
+        **(server_kwargs or {}),
+    )
+
+
+@pytest.fixture(scope="session")
+def jupyter_server_with_extension():
+    """JupyterLab with MCP extension (collaborative mode)."""
+    yield from _start_extension_server("JupyterLab+MCP")
+
+
+@pytest.fixture(scope="session")
+def jupyter_server_no_collab():
+    """JupyterLab with MCP extension, collaboration disabled (file-based code path)."""
+    yield from _start_extension_server(
+        "JupyterLab+MCP (no collab)",
+        server_kwargs={"extra_env": {"JUPYTERLAB_COLLABORATION": "false"}},
     )
 
 
@@ -327,12 +341,15 @@ def mcp_server_url(request):
         TEST_JUPYTER_SERVER=true/false (default: true)
 
     Parameters:
-        request.param (str): Either "mcp_server" or "jupyter_extension"
+        request.param (str): "mcp_server", "jupyter_extension", or "jupyter_extension_no_collab"
 
     Returns:
         str: URL of the MCP endpoint for the selected mode
     """
-    yield from _yield_mcp_url(request, "jupyter_server_with_extension")
+    yield from _yield_mcp_url(request, {
+        "jupyter_extension": "jupyter_server_with_extension",
+        "jupyter_extension_no_collab": "jupyter_server_no_collab",
+    })
 
 
 ###############################################################################
@@ -378,39 +395,53 @@ def mcp_client_parametrized(mcp_server_url):
 
 
 @pytest.fixture(scope="session")
-def otel_spans_file(tmp_path_factory):
-    """Temp JSONL file for OTel spans – shared by all OTel fixtures."""
-    return str(tmp_path_factory.mktemp("otel") / "spans.jsonl")
+def _otel_dir(tmp_path_factory):
+    """Directory for per-server OTel span files."""
+    return tmp_path_factory.mktemp("otel")
 
 
 @pytest.fixture(scope="session")
-def jupyter_server_with_extension_otel(otel_spans_file, tmp_path_factory):
-    """JupyterLab with MCP extension + OTel (port 8890)."""
-    if not TEST_JUPYTER_SERVER:
-        pytest.skip("TEST_JUPYTER_SERVER is disabled")
-
-    host = "localhost"
-    port = _find_free_port()
+def jupyter_server_with_extension_otel(_otel_dir, tmp_path_factory):
+    """JupyterLab with MCP extension + OTel."""
     stderr_log = str(tmp_path_factory.mktemp("otel_diag") / "extension_stderr.log")
-    yield from _start_server(
-        name="JupyterLab+MCP+OTel",
-        host=host,
-        port=port,
-        command=_jupyter_extension_command(host, port, otel_file=otel_spans_file),
-        readiness_endpoint="/api",
-        max_retries=10,
-        stderr_file=stderr_log,
+    yield from _start_extension_server(
+        "JupyterLab+MCP+OTel",
+        cmd_kwargs={"otel_file": str(_otel_dir / "jupyter_extension.jsonl")},
+        server_kwargs={"stderr_file": stderr_log},
+    )
+
+
+@pytest.fixture(scope="session")
+def jupyter_server_no_collab_otel(_otel_dir, tmp_path_factory):
+    """JupyterLab with MCP extension, no collab + OTel."""
+    stderr_log = str(tmp_path_factory.mktemp("otel_diag") / "no_collab_stderr.log")
+    yield from _start_extension_server(
+        "JupyterLab+MCP+OTel (no collab)",
+        cmd_kwargs={"otel_file": str(_otel_dir / "jupyter_extension_no_collab.jsonl")},
+        server_kwargs={
+            "extra_env": {"JUPYTERLAB_COLLABORATION": "false"},
+            "stderr_file": stderr_log,
+        },
     )
 
 
 @pytest.fixture(scope="function", params=_get_test_params())
-def mcp_server_url_otel(request, otel_spans_file):
+def mcp_server_url_otel(request, _otel_dir):
     """Parametrized MCP URL – both modes, with OTel enabled."""
-    yield from _yield_mcp_url(
-        request, "jupyter_server_with_extension_otel",
-        name_suffix=" (OTel)",
-        otel_file=otel_spans_file,
-    )
+    yield from _yield_mcp_url(request, {
+        "jupyter_extension": "jupyter_server_with_extension_otel",
+        "jupyter_extension_no_collab": "jupyter_server_no_collab_otel",
+    }, name_suffix=" (OTel)", otel_file=str(_otel_dir / f"{request.param}.jsonl"))
+
+
+@pytest.fixture(scope="function")
+def otel_spans_file(request, _otel_dir):
+    """Per-param OTel spans file — each server writes to its own file."""
+    params = set(_get_test_params())
+    for v in request.node.callspec.params.values():
+        if v in params:
+            return str(_otel_dir / f"{v}.jsonl")
+    return str(_otel_dir / "spans.jsonl")
 
 
 @pytest.fixture(scope="function")

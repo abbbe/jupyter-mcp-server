@@ -111,12 +111,14 @@ async def test_lifecycle_spans_emitted(mcp_client_otel: MCPClient, otel_spans_fi
 
 @pytest.mark.asyncio
 @timeout_wrapper(60)
-async def test_span_log_summary(otel_spans_file: str):
+async def test_span_log_summary(_otel_dir):
     """Final summary: print all spans collected during the session."""
     # This test deliberately runs last (alphabetical ordering) to collect
     # the most spans.  It does not call any tools itself — it just reads
     # whatever earlier tests produced.
-    spans = _read_spans(otel_spans_file)
+    spans = []
+    for f in sorted(_otel_dir.glob("*.jsonl")):
+        spans.extend(_read_spans(str(f)))
 
     # Group by span name
     by_name: dict[str, int] = {}
